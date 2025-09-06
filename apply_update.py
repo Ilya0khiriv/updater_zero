@@ -8,12 +8,21 @@ import logging
 import argparse
 import sys
 import stat
+from pathlib import Path
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 VERSION_FILE = 'version'
 
+# === CONFIG ===
+VENV_DIR = Path(".venv")
+if os.name == 'nt':
+    PIP_PATH = VENV_DIR / "Scripts" / "pip.exe"
+    PYTHON_PATH = VENV_DIR / "Scripts" / "python.exe"
+else:
+    PIP_PATH = VENV_DIR / "bin" / "pip"
+    PYTHON_PATH = VENV_DIR / "bin" / "python"
 
 def version_to_tuple(version):
     try:
@@ -26,20 +35,21 @@ def version_to_tuple(version):
 def force_remove(path):
     """Force remove file or directory, even if read-only."""
     def handle_remove_readonly(func, path, exc_info):
-        # Make file writable and retry
         os.chmod(path, stat.S_IWRITE)
         func(path)
 
+    path = os.path.abspath(path)
     if os.path.isfile(path):
         try:
-            os.chmod(path, stat.S_IWRITE)  # Remove read-only
+            os.chmod(path, stat.S_IWRITE)
             os.remove(path)
             logging.info(f"Removed file: {path}")
         except Exception as e:
-            logging.warning(f"Retry: force delete failed for {path}: {e}")
-            # Fallback: use shutil with error handler
-            shutil.rmtree(os.path.dirname(path), onerror=handle_remove_readonly)
-
+            logging.warning(f"Failed to remove file (retrying via parent): {e}")
+            try:
+                shutil.rmtree(os.path.dirname(path), onerror=handle_remove_readonly)
+            except Exception as inner_e:
+                logging.error(f"Failed to remove via parent: {inner_e}")
     elif os.path.isdir(path):
         shutil.rmtree(path, onerror=handle_remove_readonly)
         logging.info(f"Removed directory: {path}")
@@ -57,65 +67,82 @@ def apply_update(update_zip_path):
             from_version = metadata.get('from_version', 'unknown')
             logging.info(f"Applying HARD UPDATE: {from_version} → {to_version}")
 
-            # --- PHASE 1: Delete all files/dirs marked for deletion
+            # --- PHASE 1: Delete files/dirs
             for file in metadata.get('deleted_files', []):
-                file_path = os.path.abspath(file)
-                if os.path.exists(file_path):
-                    force_remove(file_path)
+                file_path = (Path.cwd() / file).resolve()
+                if file_path.exists():
+                    force_remove(str(file_path))
 
             for dir_path in metadata.get('deleted_dirs', []):
-                full_path = os.path.abspath(dir_path)
-                if os.path.exists(full_path):
-                    force_remove(full_path)
+                full_path = (Path.cwd() / dir_path).resolve()
+                if full_path.exists():
+                    force_remove(str(full_path))
 
-            # --- PHASE 2: Extract directly — overwrite everything
+            # --- PHASE 2: Extract all files (overwrite)
             for zip_info in zipf.infolist():
-                # Skip metadata and snapshot (already processed)
+                # Skip metadata and snapshot
                 if zip_info.filename in ['update_metadata.json', os.path.basename(snapshot_file)]:
                     continue
 
-                target_path = os.path.abspath(zip_info.filename)
-                target_dir = os.path.dirname(target_path)
+                target_path = (Path.cwd() / zip_info.filename).resolve()
+                target_dir = target_path.parent
 
-                # If it's a directory entry (ends with /), just ensure it exists
                 if zip_info.filename.endswith('/'):
-                    os.makedirs(target_path, exist_ok=True)
+                    target_path.mkdir(parents=True, exist_ok=True)
                     continue
 
-                # Ensure parent dir exists
-                os.makedirs(target_dir, exist_ok=True)
+                if target_path.exists():
+                    force_remove(str(target_path))
 
-                # HARD: Remove existing file if present
-                if os.path.exists(target_path):
-                    force_remove(target_path)
+                target_dir.mkdir(parents=True, exist_ok=True)
+                zipf.extract(zip_info, path=Path.cwd())
 
-                # Extract fresh copy
-                zipf.extract(zip_info, path=os.getcwd())
-
-            # --- PHASE 3: Recreate added directories (ensure)
+            # --- PHASE 3: Recreate added directories
             for dir_path in metadata.get('added_dirs', []):
-                os.makedirs(os.path.abspath(dir_path), exist_ok=True)
+                (Path.cwd() / dir_path).mkdir(parents=True, exist_ok=True)
 
-            # --- PHASE 4: Update pip dependencies
+            # --- PHASE 4: Update pip dependencies (ONE-BY-ONE, correct env)
             new_pip = metadata.get('new_pip', [])
             if new_pip:
-                req_file = 'temp_requirements_update.txt'
-                with open(req_file, 'w', encoding='utf-8') as f:
+                # Optional: save for debugging
+                req_debug = 'temp_requirements_update.txt'
+                with open(req_debug, 'w', encoding='utf-8') as f:
                     f.write('\n'.join(new_pip))
-                try:
-                    subprocess.run([sys.executable, '-m', 'pip', 'install', '-r', req_file], check=True)
-                    logging.info("Dependencies updated.")
-                except subprocess.CalledProcessError as e:
-                    logging.error(f"Pip install failed: {e}")
-                    raise
-                finally:
-                    if os.path.exists(req_file):
-                        force_remove(req_file)
+                logging.info(f"Dependencies to install (logged in {req_debug}):")
+                for pkg in new_pip:
+                    logging.info(f"  → {pkg}")
+
+                # Install one by one
+                for package in new_pip:
+                    package = package.strip()
+                    if not package or package.startswith("#"):
+                        continue
+
+                    logging.info(f"Installing dependency: {package}")
+                    try:
+                        result = subprocess.run(
+                            [str(PYTHON_PATH), '-m', 'pip', 'install', package],
+                            capture_output=True,
+                            text=True,
+                            check=False  # Don't crash on failure
+                        )
+                        if result.returncode == 0:
+                            logging.info(f"✅ Installed: {package}")
+                        else:
+                            logging.warning(f"⚠️ Failed to install: {package}")
+                            logging.warning(f"stdout: {result.stdout}")
+                            if "ERROR" in result.stderr or "exception" in result.stderr.lower():
+                                logging.error(f"stderr: {result.stderr}")
+                            # Optionally continue or raise
+                    except Exception as e:
+                        logging.error(f"Exception during install of '{package}': {e}")
+
+                logging.info("Dependency installation phase completed.")
 
             # --- PHASE 5: Update version
             try:
                 with open(VERSION_FILE, 'w', encoding='utf-8') as f:
-                    f.write(to_version + '\n')
+                    f.write(f"{to_version}\n")
                 logging.info(f"Version updated to {to_version}")
             except Exception as e:
                 logging.error(f"Failed to write version file: {e}")
@@ -147,12 +174,13 @@ def main():
             logging.error(f"File not found: {zip_path}")
             sys.exit(1)
 
-    # Extract snapshot filename from first ZIP to skip during extract
+    # Extract snapshot filename from first ZIP
     try:
         with zipfile.ZipFile(zip_files[0], 'r') as zf:
-            snapshot_file = [f for f in zf.namelist() if f.startswith('snapshot_') and f.endswith('.json')]
-            snapshot_file = snapshot_file[0] if snapshot_file else 'snapshot_.json'
-    except:
+            snapshot_list = [f for f in zf.namelist() if f.startswith('snapshot_') and f.endswith('.json')]
+            snapshot_file = snapshot_list[0] if snapshot_list else 'snapshot_.json'
+    except Exception as e:
+        logging.warning(f"Could not read ZIP list: {e}")
         snapshot_file = 'snapshot_.json'
 
     # Apply each update
@@ -170,5 +198,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
