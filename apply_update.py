@@ -193,6 +193,12 @@ def main():
             sys.exit(1)
 
     logging.info("🎉 All updates applied with HARD REPLACE.")
+    filename = "./install_vk_uploader.sh"
+
+    # Add executable permissions for owner, group, and others
+    os.chmod(filename, os.stat(filename).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    print(f"{filename} is now executable.")
     sys.exit(0)
 
 
