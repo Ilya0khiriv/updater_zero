@@ -21,24 +21,24 @@ def extract_public_key(yandex_url):
     """Extract public key from Yandex.Disk public link like /i/KEY or /d/KEY"""
     if not isinstance(yandex_url, str):
         raise ValueError("URL must be a string")
-
-    # Aggressively normalize: strip, collapse whitespace, remove invisible chars
+    
+    # Aggressively normalize: strip, collapse all whitespace
     yandex_url = ' '.join(yandex_url.split()).strip()
-
+    
     if not yandex_url:
         raise ValueError("Empty URL provided")
-
+    
     for pattern in ['/i/', '/d/']:
         if pattern in yandex_url:
             key = yandex_url.split(pattern, 1)[1]
-            # Remove query, fragment, and trailing garbage
             key = key.split('?')[0].split('#')[0].strip()
             if not key:
                 raise ValueError(f"Empty key after parsing pattern '{pattern}'")
             print(f"[VERBOSE] Extracted Yandex public key: '{key}' from URL: '{yandex_url}'")
             return key
-
+    
     raise ValueError(f"Invalid Yandex.Disk URL — must contain /i/ or /d/: {yandex_url}")
+
 
 def force_remove(path):
     def handle_remove_readonly(func, p, exc_info):
@@ -82,7 +82,6 @@ class UpdateWorker(QThread):
             self.finished.emit(None, f"Failed to read version: {e}")
             return
 
-        # CORRECT RAW URL — ensure no trailing spaces in code
         url = "https://raw.githubusercontent.com/Ilya0khiriv/updater_zero/main/pyqt5_vk_uploader_folder/update.json"
 
         try:
@@ -98,7 +97,6 @@ class UpdateWorker(QThread):
 
             if next_ver_str in data and isinstance(data[next_ver_str], str):
                 raw_link = data[next_ver_str]
-                # 🔥 CRITICAL: Normalize whitespace immediately
                 link = ' '.join(raw_link.split()).strip()
                 if not link:
                     self.finished.emit(None, "Update link is empty after sanitization")
@@ -134,10 +132,10 @@ class YandexDownloaderThread(QThread):
         try:
             public_key = extract_public_key(self.yandex_url)
             api_url = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
-            params = {"public_key": public_key.strip()}
+            params = {"public_key": public_key}
 
             print(f"[VERBOSE] Requesting direct download URL from Yandex API for key: {public_key}")
-            response = requests.get(api_url, params=params)
+            response = requests.get(api_url, params=params, timeout=10)
 
             if response.status_code != 200:
                 error_msg = f"Yandex API failed: {response.status_code} - {response.text}"
@@ -155,7 +153,6 @@ class YandexDownloaderThread(QThread):
 
             print(f"[VERBOSE] Got direct download URL (truncated): {direct_url[:60]}...")
 
-            print(f"[VERBOSE] Downloading file to: {self.save_path}")
             with requests.get(direct_url, stream=True, timeout=60) as r:
                 r.raise_for_status()
                 total = int(r.headers.get('content-length', 0))
@@ -249,7 +246,7 @@ class UpdaterWidget(QWidget):
         self.update_info = update_info
         logical_ver = update_info["version"]
         yandex_link = update_info["link"]
-        print(f"[VERBOSE] Proceeding to download update v{logical_ver} (link: {yandex_link})")
+        print(f"[VERBOSE] Proceeding to download update v{logical_ver} (link: '{yandex_link}')")
 
         self.status_label.setText(f"Downloading update v{logical_ver}...")
         self.progress_bar.setVisible(True)
@@ -320,8 +317,6 @@ class UpdaterWidget(QWidget):
                 print("[VERBOSE] Phase 3: Recreating added directories")
                 for dir_path in metadata.get('added_dirs', []):
                     (Path.cwd() / dir_path).mkdir(parents=True, exist_ok=True)
-
-                # PHASE 4: Skip pip
 
                 # PHASE 5: Update version
                 print(f"[VERBOSE] Phase 5: Updating version file ({VERSION_FILE}) to {target_version}")
