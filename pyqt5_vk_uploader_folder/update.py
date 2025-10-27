@@ -118,13 +118,26 @@ class YandexDownloaderThread(QThread):
     def run(self):
         try:
             public_key = extract_public_key(self.yandex_url)
-            api_url = 'https://cloud-api.yandex.net/v1/disk/public/resources/download?'
-            download_url = api_url + urlencode({'public_key': public_key})
+            api_url = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
+            params = {"public_key": public_key.strip()}
 
-            print(f"[VERBOSE] Requesting direct download URL from Yandex API...")
-            resp = requests.get(download_url, timeout=15)
-            resp.raise_for_status()
-            direct_url = resp.json()['href']
+            print(f"[VERBOSE] Requesting direct download URL from Yandex API for key: {public_key}")
+            response = requests.get(api_url, params=params)
+
+            if response.status_code != 200:
+                error_msg = f"Yandex API failed: {response.status_code} - {response.text}"
+                print(f"[VERBOSE] {error_msg}")
+                self.failed.emit(error_msg)
+                return
+
+            data = response.json()
+            direct_url = data.get("href")
+            if not direct_url:
+                error_msg = f"Yandex API response missing 'href': {data}"
+                print(f"[VERBOSE] {error_msg}")
+                self.failed.emit(error_msg)
+                return
+
             print(f"[VERBOSE] Got direct download URL (truncated): {direct_url[:60]}...")
 
             print(f"[VERBOSE] Downloading file to: {self.save_path}")
@@ -253,7 +266,7 @@ class UpdaterWidget(QWidget):
                     raise ValueError("update_metadata.json missing in ZIP")
 
                 metadata = json.loads(zipf.read('update_metadata.json'))
-                print(f"[VERBOSE] Loaded metadata: {metadata}")
+                print(f"[VERBOSE] Loaded meta {metadata}")
 
                 # PHASE 1: Delete files/dirs
                 print("[VERBOSE] Phase 1: Deleting obsolete files/dirs")
@@ -314,7 +327,6 @@ class UpdaterWidget(QWidget):
                 if self.state and hasattr(self.state, 'gui') and self.state.gui:
                     print("[VERBOSE] Switching to custom_view")
                     self.state.gui.switch_view("custom_view")
-                    self.state.wait = False
 
         except Exception as e:
             msg = f"<b style='color:red;'>Apply failed:</b> {str(e)}"
