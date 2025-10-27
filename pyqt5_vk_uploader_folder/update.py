@@ -8,9 +8,9 @@ import requests
 import time
 from pathlib import Path
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QProgressBar, QApplication, QPushButton, QHBoxLayout
+    QWidget, QVBoxLayout, QLabel, QProgressBar, QApplication, QPushButton
 )
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont
 
 VERSION_FILE = "version"
@@ -125,7 +125,7 @@ class YandexDownloaderThread(QThread):
                         f.write(chunk)
                         downloaded += len(chunk)
 
-                        # Speed monitoring (every ~1 sec)
+                        # Speed monitoring
                         now = time.time()
                         if self._last_time is None:
                             self._last_time = now
@@ -165,7 +165,7 @@ class UpdaterWidget(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Автообновление")
-        self.resize(480, 300)
+        self.resize(480, 280)
         self.setStyleSheet("""
             QWidget {
                 background-color: #ffffff;
@@ -184,7 +184,7 @@ class UpdaterWidget(QWidget):
                 border-radius: 3px;
             }
             QPushButton {
-                background-color: #4a90e2;
+                background-color: #f57c00;
                 color: white;
                 border: none;
                 padding: 6px 16px;
@@ -192,7 +192,7 @@ class UpdaterWidget(QWidget):
                 font-weight: bold;
             }
             QPushButton:hover {
-                background-color: #357abd;
+                background-color: #e65100;
             }
         """)
         self.state = None
@@ -201,6 +201,7 @@ class UpdaterWidget(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        self.state.wait = True
         if not self.layout():
             self._init_ui()
         self.check_update()
@@ -230,14 +231,7 @@ class UpdaterWidget(QWidget):
 
         self.slow_warning_button = QPushButton("Закрыть и отключить VPN")
         self.slow_warning_button.setVisible(False)
-        self.slow_warning_button.clicked.connect(self.close)
-        self.slow_warning_button.setStyleSheet("""
-            background-color: #f57c00;
-            color: white;
-            padding: 6px 16px;
-            border-radius: 4px;
-            font-weight: bold;
-        """)
+        self.slow_warning_button.clicked.connect(self._handle_close_or_switch)
 
         layout.addWidget(self.current_label)
         layout.addWidget(self.status_label)
@@ -261,15 +255,25 @@ class UpdaterWidget(QWidget):
     def on_check_finished(self, update_info, error):
         if error:
             self.status_label.setText(f"<b style='color:#d32f2f;'>Ошибка:</b> {error}")
+            if self.state:
+                self.state.wait = False
+            else:
+                self.close()
             return
         if not update_info:
             self.status_label.setText("<b style='color:#388e3c;'>✓ Обновлений нет</b>")
             self.progress_bar.setValue(100)
             self.progress_bar.setFormat("100%")
+
+
+            if self.state:
+                self.state.wait = False
+            else:
+                self.close()
             return
 
         self.update_info = update_info
-        self.start_download()  # No pre-check — start immediately
+        self.start_download()
 
     def start_download(self):
         logical_ver = self.update_info["version"]
@@ -352,12 +356,19 @@ class UpdaterWidget(QWidget):
                 self.progress_bar.setValue(100)
                 self.progress_bar.setFormat("100%")
 
-                if self.state and hasattr(self.state, 'gui') and self.state.gui:
-                    self.state.gui.switch_view("custom_view")
+                # Auto-close or switch after success
+                QTimer.singleShot(1500, self._handle_close_or_switch)
 
         except Exception as e:
             self.status_label.setText(f"<b style='color:#d32f2f;'>Ошибка применения:</b> {str(e)}")
             print(f"[VERBOSE] Update apply error: {e}")
+
+    def _handle_close_or_switch(self):
+        """Close window or switch view based on state presence."""
+        if self.state:
+            self.state.wait = False
+        else:
+            self.close()
 
 
 if __name__ == "__main__":
