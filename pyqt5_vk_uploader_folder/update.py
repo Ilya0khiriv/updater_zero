@@ -5,39 +5,16 @@ import zipfile
 import shutil
 import stat
 import requests
-from urllib.parse import urlencode
+import time
 from pathlib import Path
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QProgressBar, QApplication
+    QWidget, QVBoxLayout, QLabel, QProgressBar, QApplication, QPushButton, QHBoxLayout
 )
-from PyQt5.QtCore import QThread, pyqtSignal, Qt
+from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 
-
 VERSION_FILE = "version"
-
-
-def extract_public_key(yandex_url):
-    """Extract public key from Yandex.Disk public link like /i/KEY or /d/KEY"""
-    if not isinstance(yandex_url, str):
-        raise ValueError("URL must be a string")
-    
-    # Aggressively normalize: strip, collapse all whitespace
-    yandex_url = ' '.join(yandex_url.split()).strip()
-    
-    if not yandex_url:
-        raise ValueError("Empty URL provided")
-    
-    for pattern in ['/i/', '/d/']:
-        if pattern in yandex_url:
-            key = yandex_url.split(pattern, 1)[1]
-            key = key.split('?')[0].split('#')[0].strip()
-            if not key:
-                raise ValueError(f"Empty key after parsing pattern '{pattern}'")
-            print(f"[VERBOSE] Extracted Yandex public key: '{key}' from URL: '{yandex_url}'")
-            return key
-    
-    raise ValueError(f"Invalid Yandex.Disk URL — must contain /i/ or /d/: {yandex_url}")
+UPDATE_JSON_URL = "https://raw.githubusercontent.com/Ilya0khiriv/updater_zero/main/pyqt5_vk_uploader_folder/update.json"
 
 
 def force_remove(path):
@@ -47,18 +24,13 @@ def force_remove(path):
 
     path = os.path.abspath(path)
     if os.path.isfile(path):
-        print(f"[VERBOSE] Removing file: {path}")
         try:
             os.chmod(path, stat.S_IWRITE)
             os.remove(path)
         except Exception as e:
-            print(f"[VERBOSE] Failed to remove file directly: {e}")
-            try:
-                shutil.rmtree(os.path.dirname(path), onerror=handle_remove_readonly)
-            except Exception as inner_e:
-                print(f"[VERBOSE] Failed to remove via parent dir: {inner_e}")
+            print(f"[VERBOSE] Failed to remove file {path}: {e}")
+            shutil.rmtree(os.path.dirname(path), onerror=handle_remove_readonly)
     elif os.path.isdir(path):
-        print(f"[VERBOSE] Removing directory: {path}")
         shutil.rmtree(path, onerror=handle_remove_readonly)
 
 
@@ -67,125 +39,165 @@ class UpdateWorker(QThread):
     current_version_fetched = pyqtSignal(int)
 
     def run(self):
-        print("[VERBOSE] Starting update check...")
+        print("[VERBOSE] Starting update check (fetching from GitHub)...")
         current_version = 0
         try:
             if os.path.exists(VERSION_FILE):
                 with open(VERSION_FILE, "r") as f:
                     current_version = int(f.read().strip() or "0")
-                print(f"[VERBOSE] Current version read from file: {current_version}")
+                print(f"[VERBOSE] Current version: {current_version}")
             else:
-                print("[VERBOSE] No version file found. Assuming version 0.")
+                print("[VERBOSE] No version file. Assuming version 0.")
             self.current_version_fetched.emit(current_version)
         except Exception as e:
-            print(f"[VERBOSE] Failed to read version file: {e}")
-            self.finished.emit(None, f"Failed to read version: {e}")
+            print(f"[VERBOSE] Failed to read version: {e}")
+            self.finished.emit(None, f"Не удалось прочитать версию: {e}")
             return
 
-        url = "https://raw.githubusercontent.com/Ilya0khiriv/updater_zero/main/pyqt5_vk_uploader_folder/update.json"
-
         try:
-            print(f"[VERBOSE] Fetching update.json from: {url}")
-            with requests.get(url, timeout=10) as response:
-                response.raise_for_status()
-                data = response.json()
-            print(f"[VERBOSE] update.json loaded: {data}")
+            response = requests.get(UPDATE_JSON_URL, timeout=10)
+            response.raise_for_status()
+            version_map = response.json()
 
             next_ver = current_version + 1
             next_ver_str = str(next_ver)
-            print(f"[VERBOSE] Looking for next version key: '{next_ver_str}'")
 
-            if next_ver_str in data and isinstance(data[next_ver_str], str):
-                raw_link = data[next_ver_str]
-                link = ' '.join(raw_link.split()).strip()
-                if not link:
-                    self.finished.emit(None, "Update link is empty after sanitization")
-                    return
-
-                update_info = {
-                    "version": next_ver,
-                    "link": link,
-                    "current_version": current_version
-                }
-                print(f"[VERBOSE] Update found: v{next_ver} → '{link}'")
-                self.finished.emit(update_info, "")
+            if next_ver_str not in version_map:
+                self.finished.emit(None, "")
                 return
 
-            print("[VERBOSE] No next version found in update.json")
-            self.finished.emit(None, "")
+            yandex_link = version_map[next_ver_str].strip()
+            if not yandex_link or not yandex_link.startswith("http"):
+                self.finished.emit(None, f"Некорректная ссылка для версии {next_ver}")
+                return
+
+            update_info = {
+                "version": next_ver,
+                "link": yandex_link,
+                "current_version": current_version
+            }
+            print(f"[VERBOSE] Update found: v{next_ver} → {yandex_link}")
+            self.finished.emit(update_info, "")
+
         except Exception as e:
-            print(f"[VERBOSE] Error during update check: {e}")
-            self.finished.emit(None, f"Network/JSON error: {e}")
+            error_msg = f"Ошибка при загрузке списка обновлений: {e}"
+            print(f"[VERBOSE] {error_msg}")
+            self.finished.emit(None, error_msg)
 
 
 class YandexDownloaderThread(QThread):
     progress = pyqtSignal(int)
     finished = pyqtSignal(str)
     failed = pyqtSignal(str)
+    slow_speed_detected = pyqtSignal()
 
     def __init__(self, yandex_url, save_path):
         super().__init__()
         self.yandex_url = yandex_url
         self.save_path = save_path
+        self._last_bytes = 0
+        self._last_time = None
+        self._slow_counter = 0
 
     def run(self):
         try:
-            public_key = extract_public_key(self.yandex_url)
             api_url = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
-            params = {"public_key": public_key}
-
-            print(f"[VERBOSE] Requesting direct download URL from Yandex API for key: {public_key}")
+            params = {"public_key": self.yandex_url.strip()}
             response = requests.get(api_url, params=params, timeout=10)
-
             if response.status_code != 200:
-                error_msg = f"Yandex API failed: {response.status_code} - {response.text}"
-                print(f"[VERBOSE] {error_msg}")
-                self.failed.emit(error_msg)
+                self.failed.emit(f"Yandex API error: {response.status_code}")
                 return
 
-            data = response.json()
-            direct_url = data.get("href")
+            direct_url = response.json().get("href")
             if not direct_url:
-                error_msg = f"Yandex API response missing 'href': {data}"
-                print(f"[VERBOSE] {error_msg}")
-                self.failed.emit(error_msg)
+                self.failed.emit("Yandex не вернул ссылку для скачивания")
                 return
 
-            print(f"[VERBOSE] Got direct download URL (truncated): {direct_url[:60]}...")
+            r = requests.get(direct_url, stream=True, timeout=60)
+            r.raise_for_status()
 
-            with requests.get(direct_url, stream=True, timeout=60) as r:
-                r.raise_for_status()
-                total = int(r.headers.get('content-length', 0))
-                downloaded = 0
+            total = int(r.headers.get('content-length', 0))
+            downloaded = 0
 
-                with open(self.save_path, 'wb') as f:
-                    for chunk in r.iter_content(4096):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            if total > 0:
-                                percent = int(downloaded * 100 / total)
-                                self.progress.emit(percent)
-                            else:
-                                self.progress.emit(min(95, downloaded // 1024))
+            with open(self.save_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+                        # Speed monitoring (every ~1 sec)
+                        now = time.time()
+                        if self._last_time is None:
+                            self._last_time = now
+                            self._last_bytes = downloaded
+                        else:
+                            elapsed = now - self._last_time
+                            if elapsed >= 1.0:
+                                bytes_diff = downloaded - self._last_bytes
+                                speed_kb_s = (bytes_diff / 1024) / elapsed
+                                if speed_kb_s <= 200:
+                                    self._slow_counter += 1
+                                else:
+                                    self._slow_counter = 0
+
+                                if self._slow_counter >= 3:
+                                    self.slow_speed_detected.emit()
+
+                                self._last_bytes = downloaded
+                                self._last_time = now
+
+                        # Progress
+                        if total > 0:
+                            percent = min(99, int(100 * downloaded / total))
+                            self.progress.emit(percent)
+                        else:
+                            mb = downloaded // (1024 * 1024)
+                            self.progress.emit(min(99, max(1, mb)))
 
             self.progress.emit(100)
-            print(f"[VERBOSE] Download completed: {self.save_path}")
             self.finished.emit(self.save_path)
 
         except Exception as e:
-            print(f"[VERBOSE] Download failed: {e}")
             self.failed.emit(str(e))
 
 
 class UpdaterWidget(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Auto Updater")
-        self.resize(480, 220)
-        self.setStyleSheet("background-color: #f9f9f9;")
+        self.setWindowTitle("Автообновление")
+        self.resize(480, 300)
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #ffffff;
+                color: #222222;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            }
+            QProgressBar {
+                border: 1px solid #d0d0d0;
+                border-radius: 4px;
+                text-align: center;
+                color: #444;
+                background: #f5f5f5;
+            }
+            QProgressBar::chunk {
+                background-color: #4a90e2;
+                border-radius: 3px;
+            }
+            QPushButton {
+                background-color: #4a90e2;
+                color: white;
+                border: none;
+                padding: 6px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #357abd;
+            }
+        """)
         self.state = None
         self.update_info = None
+        self.slow_warning_button = None
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -195,70 +207,95 @@ class UpdaterWidget(QWidget):
 
     def _init_ui(self):
         layout = QVBoxLayout()
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(12)
+        layout.setContentsMargins(30, 25, 30, 25)
+        layout.setSpacing(16)
 
         label_font = QFont()
-        label_font.setPointSize(11)
+        label_font.setPointSize(12)
 
-        self.current_label = QLabel("Current version: —")
+        self.current_label = QLabel("Текущая версия: —")
         self.current_label.setFont(label_font)
+        self.current_label.setStyleSheet("font-weight: 500;")
 
-        self.status_label = QLabel("Checking for updates...")
+        self.status_label = QLabel("Проверка обновлений…")
         self.status_label.setFont(label_font)
-        self.status_label.setStyleSheet("color: #444;")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #555; padding: 4px 0;")
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
         self.progress_bar.setFormat("0%")
-        self.progress_bar.setVisible(False)
+        self.progress_bar.setMaximumHeight(20)
+
+        self.slow_warning_button = QPushButton("Закрыть и отключить VPN")
+        self.slow_warning_button.setVisible(False)
+        self.slow_warning_button.clicked.connect(self.close)
+        self.slow_warning_button.setStyleSheet("""
+            background-color: #f57c00;
+            color: white;
+            padding: 6px 16px;
+            border-radius: 4px;
+            font-weight: bold;
+        """)
 
         layout.addWidget(self.current_label)
         layout.addWidget(self.status_label)
         layout.addWidget(self.progress_bar)
+        layout.addWidget(self.slow_warning_button)
         layout.addStretch()
+
         self.setLayout(layout)
 
     def check_update(self):
-        print("[VERBOSE] Initiating update check...")
         self.worker = UpdateWorker()
         self.worker.current_version_fetched.connect(self.update_current_label)
         self.worker.finished.connect(self.on_check_finished)
         self.worker.start()
+        self.status_label.setText("Проверка обновлений…")
+        self.progress_bar.setValue(0)
 
     def update_current_label(self, ver):
-        self.current_label.setText(f"Current version: {ver}")
+        self.current_label.setText(f"Текущая версия: {ver}")
 
     def on_check_finished(self, update_info, error):
         if error:
-            msg = f"<b style='color:red;'>Error:</b> {error}"
-            self.status_label.setText(msg)
-            print(f"[VERBOSE] Update check error: {error}")
+            self.status_label.setText(f"<b style='color:#d32f2f;'>Ошибка:</b> {error}")
             return
-
         if not update_info:
-            msg = "<b style='color:green;'>✓ Up to date</b>"
-            self.status_label.setText(msg)
-            print("[VERBOSE] No update available.")
+            self.status_label.setText("<b style='color:#388e3c;'>✓ Обновлений нет</b>")
+            self.progress_bar.setValue(100)
+            self.progress_bar.setFormat("100%")
             return
 
         self.update_info = update_info
-        logical_ver = update_info["version"]
-        yandex_link = update_info["link"]
-        print(f"[VERBOSE] Proceeding to download update v{logical_ver} (link: '{yandex_link}')")
+        self.start_download()  # No pre-check — start immediately
 
-        self.status_label.setText(f"Downloading update v{logical_ver}...")
-        self.progress_bar.setVisible(True)
+    def start_download(self):
+        logical_ver = self.update_info["version"]
+        yandex_link = self.update_info["link"]
+
+        self.status_label.setText(f"Загрузка обновления v{logical_ver}…")
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("0%")
+        self.slow_warning_button.setVisible(False)
 
         zip_name = f"update_v{logical_ver}.zip"
         self.downloader = YandexDownloaderThread(yandex_link, zip_name)
         self.downloader.progress.connect(self.on_progress)
         self.downloader.finished.connect(self.on_zip_downloaded)
-        self.downloader.failed.connect(lambda e: self.status_label.setText(f"<b style='color:red;'>Download failed:</b> {e}"))
+        self.downloader.failed.connect(
+            lambda e: self.status_label.setText(f"<b style='color:#d32f2f;'>Ошибка загрузки:</b> {e}")
+        )
+        self.downloader.slow_speed_detected.connect(self.on_slow_speed_detected)
         self.downloader.start()
+
+    def on_slow_speed_detected(self):
+        self.status_label.setText(
+            "<b style='color:#e65100;'>⚠️ Скачивание очень медленное (≤200 КБ/с)</b><br>"
+            "Возможно, включён VPN. Отключите его и перезапустите обновление."
+        )
+        self.slow_warning_button.setVisible(True)
 
     def on_progress(self, percent):
         self.progress_bar.setValue(percent)
@@ -266,22 +303,17 @@ class UpdaterWidget(QWidget):
 
     def on_zip_downloaded(self, zip_path):
         logical_ver = self.update_info["version"]
-        print(f"[VERBOSE] ZIP downloaded ({zip_path}). Applying update v{logical_ver}...")
-        self.status_label.setText(f"Applying hard-replace update v{logical_ver}...")
+        self.status_label.setText(f"Применение обновления v{logical_ver}…")
         self.apply_hard_update(zip_path, logical_ver)
 
     def apply_hard_update(self, zip_path, target_version):
         try:
-            print(f"[VERBOSE] Opening ZIP: {zip_path}")
             with zipfile.ZipFile(zip_path, 'r') as zipf:
                 if 'update_metadata.json' not in zipf.namelist():
-                    raise ValueError("update_metadata.json missing in ZIP")
+                    raise ValueError("Файл update_metadata.json отсутствует в архиве")
 
                 metadata = json.loads(zipf.read('update_metadata.json'))
-                print(f"[VERBOSE] Loaded meta {metadata}")
 
-                # PHASE 1: Delete files/dirs
-                print("[VERBOSE] Phase 1: Deleting obsolete files/dirs")
                 for file in metadata.get('deleted_files', []):
                     fp = (Path.cwd() / file).resolve()
                     if fp.exists():
@@ -292,56 +324,40 @@ class UpdaterWidget(QWidget):
                     if dp.exists():
                         force_remove(str(dp))
 
-                # PHASE 2: Extract
-                print("[VERBOSE] Phase 2: Extracting new files")
-                snapshot_file = None
-                for name in zipf.namelist():
-                    if name.startswith('snapshot_') and name.endswith('.json'):
-                        snapshot_file = name
-                        break
+                snapshot_file = next(
+                    (name for name in zipf.namelist() if name.startswith('snapshot_') and name.endswith('.json')),
+                    None
+                )
 
                 for zip_info in zipf.infolist():
                     if zip_info.filename in ['update_metadata.json', snapshot_file or '']:
                         continue
-
                     target = (Path.cwd() / zip_info.filename).resolve()
-                    if zip_info.is_dir():
-                        target.mkdir(parents=True, exist_ok=True)
-                    else:
+                    if not zip_info.is_dir():
                         if target.exists():
                             force_remove(str(target))
                         target.parent.mkdir(parents=True, exist_ok=True)
                         zipf.extract(zip_info, path=Path.cwd())
 
-                # PHASE 3: Recreate added dirs
-                print("[VERBOSE] Phase 3: Recreating added directories")
                 for dir_path in metadata.get('added_dirs', []):
                     (Path.cwd() / dir_path).mkdir(parents=True, exist_ok=True)
 
-                # PHASE 5: Update version
-                print(f"[VERBOSE] Phase 5: Updating version file ({VERSION_FILE}) to {target_version}")
                 with open(VERSION_FILE, 'w') as f:
                     f.write(str(target_version))
 
-                # Cleanup
                 os.remove(zip_path)
-                print("[VERBOSE] Cleanup: ZIP file removed")
 
-                # UI update
-                self.current_label.setText(f"Current version: {target_version}")
-                self.status_label.setText(f"<b style='color:green;'>✅ Update applied: v{target_version}</b>")
-                self.progress_bar.setFormat("100%")
+                self.current_label.setText(f"Текущая версия: {target_version}")
+                self.status_label.setText(f"<b style='color:#388e3c;'>✅ Обновление применено: v{target_version}</b>")
                 self.progress_bar.setValue(100)
+                self.progress_bar.setFormat("100%")
 
-                # Switch view
                 if self.state and hasattr(self.state, 'gui') and self.state.gui:
-                    print("[VERBOSE] Switching to custom_view")
                     self.state.gui.switch_view("custom_view")
 
         except Exception as e:
-            msg = f"<b style='color:red;'>Apply failed:</b> {str(e)}"
-            self.status_label.setText(msg)
-            print(f"[VERBOSE] Update application failed: {e}")
+            self.status_label.setText(f"<b style='color:#d32f2f;'>Ошибка применения:</b> {str(e)}")
+            print(f"[VERBOSE] Update apply error: {e}")
 
 
 if __name__ == "__main__":
