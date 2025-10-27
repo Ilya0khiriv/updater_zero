@@ -201,7 +201,7 @@ class UpdaterWidget(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        self.state.wait = True
+
         if not self.layout():
             self._init_ui()
         self.check_update()
