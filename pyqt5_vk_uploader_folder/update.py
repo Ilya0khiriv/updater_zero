@@ -19,15 +19,26 @@ VERSION_FILE = "version"
 
 def extract_public_key(yandex_url):
     """Extract public key from Yandex.Disk public link like /i/KEY or /d/KEY"""
-    # Check for both /i/ and /d/ patterns
+    if not isinstance(yandex_url, str):
+        raise ValueError("URL must be a string")
+    
+    # Aggressively normalize: strip, collapse whitespace, remove invisible chars
+    yandex_url = ' '.join(yandex_url.split()).strip()
+    
+    if not yandex_url:
+        raise ValueError("Empty URL provided")
+    
     for pattern in ['/i/', '/d/']:
         if pattern in yandex_url:
             key = yandex_url.split(pattern, 1)[1]
-            # Remove any query params or fragments
+            # Remove query, fragment, and trailing garbage
             key = key.split('?')[0].split('#')[0].strip()
-            print(f"[VERBOSE] Extracted Yandex public key: {key} from URL: {yandex_url}")
+            if not key:
+                raise ValueError(f"Empty key after parsing pattern '{pattern}'")
+            print(f"[VERBOSE] Extracted Yandex public key: '{key}' from URL: '{yandex_url}'")
             return key
-    raise ValueError(f"Invalid Yandex.Disk URL, no /i/ or /d/: {yandex_url}")
+    
+    raise ValueError(f"Invalid Yandex.Disk URL — must contain /i/ or /d/: {yandex_url}")
 
 
 def force_remove(path):
@@ -116,54 +127,60 @@ class YandexDownloaderThread(QThread):
         self.save_path = save_path
 
     def run(self):
-        try:
-            public_key = extract_public_key(self.yandex_url)
-            api_url = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
-            params = {"public_key": public_key.strip()}
+    print("[VERBOSE] Starting update check...")
+    current_version = 0
+    try:
+        if os.path.exists(VERSION_FILE):
+            with open(VERSION_FILE, "r") as f:
+                current_version = int(f.read().strip() or "0")
+            print(f"[VERBOSE] Current version read from file: {current_version}")
+        else:
+            print("[VERBOSE] No version file found. Assuming version 0.")
+        self.current_version_fetched.emit(current_version)
+    except Exception as e:
+        print(f"[VERBOSE] Failed to read version file: {e}")
+        self.finished.emit(None, f"Failed to read version: {e}")
+        return
 
-            print(f"[VERBOSE] Requesting direct download URL from Yandex API for key: {public_key}")
-            response = requests.get(api_url, params=params)
+    # CORRECT RAW URL — ensure no trailing spaces in code
+    url = "https://raw.githubusercontent.com/Ilya0khiriv/updater_zero/main/pyqt5_vk_uploader_folder/update.json"
 
-            if response.status_code != 200:
-                error_msg = f"Yandex API failed: {response.status_code} - {response.text}"
-                print(f"[VERBOSE] {error_msg}")
-                self.failed.emit(error_msg)
-                return
-
+    try:
+        print(f"[VERBOSE] Fetching update.json from: {url}")
+        with requests.get(url, timeout=10) as response:
+            response.raise_for_status()
             data = response.json()
-            direct_url = data.get("href")
-            if not direct_url:
-                error_msg = f"Yandex API response missing 'href': {data}"
-                print(f"[VERBOSE] {error_msg}")
-                self.failed.emit(error_msg)
+        print(f"[VERBOSE] update.json loaded: {data}")
+
+        next_ver = current_version + 1
+        next_ver_str = str(next_ver)
+        print(f"[VERBOSE] Looking for next version key: '{next_ver_str}'")
+
+        if next_ver_str in data and isinstance(data[next_ver_str], str):
+            raw_link = data[next_ver_str]
+            # 🔥 CRITICAL: Normalize whitespace immediately
+            link = ' '.join(raw_link.split()).strip()
+            if not link:
+                self.finished.emit(None, "Update link is empty after sanitization")
                 return
 
-            print(f"[VERBOSE] Got direct download URL (truncated): {direct_url[:60]}...")
+            update_info = {
+                "version": next_ver,
+                "link": link,
+                "current_version": current_version
+            }
+            print(f"[VERBOSE] Update found: v{next_ver} → '{link}'")
+            self.finished.emit(update_info, "")
+            return
 
-            print(f"[VERBOSE] Downloading file to: {self.save_path}")
-            with requests.get(direct_url, stream=True, timeout=60) as r:
-                r.raise_for_status()
-                total = int(r.headers.get('content-length', 0))
-                downloaded = 0
+        print("[VERBOSE] No next version found in update.json")
+        self.finished.emit(None, "")
+    except Exception as e:
+        print(f"[VERBOSE] Error during update check: {e}")
+        self.finished.emit(None, f"Network/JSON error: {e}")
 
-                with open(self.save_path, 'wb') as f:
-                    for chunk in r.iter_content(4096):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            if total > 0:
-                                percent = int(downloaded * 100 / total)
-                                self.progress.emit(percent)
-                            else:
-                                self.progress.emit(min(95, downloaded // 1024))
 
-            self.progress.emit(100)
-            print(f"[VERBOSE] Download completed: {self.save_path}")
-            self.finished.emit(self.save_path)
 
-        except Exception as e:
-            print(f"[VERBOSE] Download failed: {e}")
-            self.failed.emit(str(e))
 
 
 class UpdaterWidget(QWidget):
