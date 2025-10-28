@@ -39,7 +39,7 @@ class UpdateWorker(QThread):
     current_version_fetched = pyqtSignal(int)
 
     def run(self):
-        print("[VERBOSE] Starting update check (fetching from GitHub)...")
+        print("[VERBOSE] Starting full update check (fetching all pending versions)...")
         current_version = 0
         try:
             if os.path.exists(VERSION_FILE):
@@ -55,29 +55,40 @@ class UpdateWorker(QThread):
             return
 
         try:
-            response = requests.get(UPDATE_JSON_URL, timeout=10)
+            response = requests.get(UPDATE_JSON_URL.strip(), timeout=10)
             response.raise_for_status()
             version_map = response.json()
 
-            next_ver = current_version + 1
-            next_ver_str = str(next_ver)
-
-            if next_ver_str not in version_map:
-                self.finished.emit(None, "")
+            # Get all available version numbers as integers
+            available_versions = []
+            for v in version_map.keys():
+                if v.isdigit():
+                    available_versions.append(int(v))
+            if not available_versions:
+                self.finished.emit([], "")
                 return
 
-            yandex_link = version_map[next_ver_str].strip()
-            if not yandex_link or not yandex_link.startswith("http"):
-                self.finished.emit(None, f"Некорректная ссылка для версии {next_ver}")
+            latest_version = max(available_versions)
+            pending_versions = [v for v in range(current_version + 1, latest_version + 1) if v in available_versions]
+
+            if not pending_versions:
+                self.finished.emit([], "")
                 return
 
-            update_info = {
-                "version": next_ver,
-                "link": yandex_link,
-                "current_version": current_version
-            }
-            print(f"[VERBOSE] Update found: v{next_ver} → {yandex_link}")
-            self.finished.emit(update_info, "")
+            updates = []
+            for ver in pending_versions:
+                ver_str = str(ver)
+                yandex_link = version_map[ver_str].strip()
+                if not yandex_link or not yandex_link.startswith("http"):
+                    self.finished.emit(None, f"Некорректная ссылка для версии {ver}")
+                    return
+                updates.append({
+                    "version": ver,
+                    "link": yandex_link
+                })
+
+            print(f"[VERBOSE] Pending updates: {[u['version'] for u in updates]}")
+            self.finished.emit(updates, "")
 
         except Exception as e:
             error_msg = f"Ошибка при загрузке списка обновлений: {e}"
@@ -125,7 +136,6 @@ class YandexDownloaderThread(QThread):
                         f.write(chunk)
                         downloaded += len(chunk)
 
-                        # Speed monitoring (every ~1 sec)
                         now = time.time()
                         if self._last_time is None:
                             self._last_time = now
@@ -146,7 +156,6 @@ class YandexDownloaderThread(QThread):
                                 self._last_bytes = downloaded
                                 self._last_time = now
 
-                        # Progress
                         if total > 0:
                             percent = min(99, int(100 * downloaded / total))
                             self.progress.emit(percent)
@@ -196,6 +205,8 @@ class UpdaterWidget(QWidget):
             }
         """)
         self.state = None
+        self.pending_updates = []
+        self.current_update_index = 0
         self.update_info = None
         self.slow_warning_button = None
 
@@ -261,11 +272,12 @@ class UpdaterWidget(QWidget):
     def update_current_label(self, ver):
         self.current_label.setText(f"Текущая версия: {ver}")
 
-    def on_check_finished(self, update_info, error):
+    def on_check_finished(self, update_list, error):
         if error:
             self.status_label.setText(f"<b style='color:#d32f2f;'>Ошибка:</b> {error}")
             return
-        if not update_info:
+
+        if not update_list:
             self.status_label.setText("<b style='color:#388e3c;'>✓ Обновлений нет</b>")
             self.progress_bar.setValue(100)
             self.progress_bar.setFormat("100%")
@@ -276,8 +288,25 @@ class UpdaterWidget(QWidget):
                 exit()
             return
 
-        self.update_info = update_info
-        self.start_download()  # No pre-check — start immediately
+        self.pending_updates = update_list
+        self.current_update_index = 0
+        self.apply_next_update()
+
+    def apply_next_update(self):
+        if self.current_update_index >= len(self.pending_updates):
+            final_ver = self.pending_updates[-1]["version"]
+            self.current_label.setText(f"Текущая версия: {final_ver}")
+            self.status_label.setText(f"<b style='color:#388e3c;'>✅ Все обновления применены (v{final_ver})</b>")
+            self.progress_bar.setValue(100)
+            self.progress_bar.setFormat("100%")
+            if self.state:
+                self.state.wait = False
+            else:
+                exit()
+            return
+
+        self.update_info = self.pending_updates[self.current_update_index]
+        self.start_download()
 
     def start_download(self):
         logical_ver = self.update_info["version"]
@@ -293,7 +322,7 @@ class UpdaterWidget(QWidget):
         self.downloader.progress.connect(self.on_progress)
         self.downloader.finished.connect(self.on_zip_downloaded)
         self.downloader.failed.connect(
-            lambda e: self.status_label.setText(f"<b style='color:#d32f2f;'>Ошибка загрузки:</b> {e}")
+            lambda e: self.status_label.setText(f"<b style='color:#d32f2f;'>Ошибка загрузки v{self.update_info['version']}:</b> {e}")
         )
         self.downloader.slow_speed_detected.connect(self.on_slow_speed_detected)
         self.downloader.start()
@@ -355,20 +384,12 @@ class UpdaterWidget(QWidget):
 
                 os.remove(zip_path)
 
-                self.current_label.setText(f"Текущая версия: {target_version}")
-                self.status_label.setText(f"<b style='color:#388e3c;'>✅ Обновление применено: v{target_version}</b>")
-                self.progress_bar.setValue(100)
-                self.progress_bar.setFormat("100%")
-
-                if self.state:
-                    self.state.wait = False
-                else:
-                    exit()
-
-
+                # Proceed to next update
+                self.current_update_index += 1
+                self.apply_next_update()
 
         except Exception as e:
-            self.status_label.setText(f"<b style='color:#d32f2f;'>Ошибка применения:</b> {str(e)}")
+            self.status_label.setText(f"<b style='color:#d32f2f;'>Ошибка применения v{target_version}:</b> {str(e)}")
             print(f"[VERBOSE] Update apply error: {e}")
 
 
