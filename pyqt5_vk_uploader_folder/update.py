@@ -57,7 +57,7 @@ class UpdateWorker(QThread):
         try:
             # Fetch update.json (no cache-busting needed in URL string itself)
 
-            cache_buster_url = f"{base_url}?t={int(time.time())}"
+            cache_buster_url = f"{UPDATE_JSON_URL}?t={int(time.time())}"
             response = requests.get(cache_buster_url, timeout=10)
             
             response.raise_for_status()
