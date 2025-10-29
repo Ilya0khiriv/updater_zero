@@ -55,7 +55,8 @@ class UpdateWorker(QThread):
             return
 
         try:
-            # Fix: interpolate time.now() into URL properly
+
+            
             url = f"https://raw.githubusercontent.com/Ilya0khiriv/updater_zero/main/pyqt5_vk_uploader_folder/update.json?_={int(time.time())}"
             response = requests.get(url, timeout=10)
             response.raise_for_status()
@@ -106,17 +107,22 @@ class YandexDownloaderThread(QThread):
             # Normalize URL
             clean_url = self.yandex_url.strip()
 
-            if "disk.yandex.ru" in clean_url or "yadi.sk" in clean_url:
-                api_url = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
-                params = {"public_key": clean_url}
-                response = requests.get(api_url, params=params, timeout=10)
-                if response.status_code != 200:
-                    self.failed.emit(f"Yandex API error: {response.status_code}")
-                    return
-
-                direct_url = response.json().get("href")
-            else:
+                        # Fix: interpolate time.now() into URL properly
+            if "downloader.disk.yandex.ru" in clean_url:
                 direct_url = clean_url
+            else:
+
+                if "disk.yandex.ru" in clean_url or "yadi.sk" in clean_url:
+                    api_url = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
+                    params = {"public_key": clean_url}
+                    response = requests.get(api_url, params=params, timeout=10)
+                    if response.status_code != 200:
+                        self.failed.emit(f"Yandex API error: {response.status_code}")
+                        return
+    
+                    direct_url = response.json().get("href")
+                else:
+                    direct_url = clean_url
 
             if not direct_url:
                 self.failed.emit("Yandex не вернул ссылку для скачивания")
