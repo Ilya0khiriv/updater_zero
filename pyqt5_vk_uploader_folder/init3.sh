@@ -43,6 +43,12 @@ log_verbose "Config directory: $CONFIG_DIR"
 
 # === RUNNING FROM INSTALLED LOCATION ===
 if [[ "$SCRIPT_DIR" == "$CONFIG_DIR" ]]; then
+    UPDATE_PY="$CONFIG_DIR/update.py"
+    if [[ ! -f "$UPDATE_PY" ]]; then
+        log_info "Downloading update.py..."
+        curl -fsSL -o "$UPDATE_PY" \
+            "https://raw.githubusercontent.com/Ilya0khiriv/updater_zero/main/pyqt5_vk_uploader_folder/update.py?$RANDOM"
+    fi
     log_verbose "Running from installed location."
 
     if [[ -f "$BUILT_MARKER" ]]; then
@@ -70,11 +76,6 @@ if [[ "$SCRIPT_DIR" == "$CONFIG_DIR" ]]; then
         # Ensure app code
         if [[ ! -d "$CONFIG_DIR/pyqt5_ui" ]]; then
             UPDATE_PY="$CONFIG_DIR/update.py"
-            if [[ ! -f "$UPDATE_PY" ]]; then
-                log_info "Downloading update.py..."
-                curl -fsSL -o "$UPDATE_PY" \
-                    "https://raw.githubusercontent.com/Ilya0khiriv/updater_zero/main/pyqt5_vk_uploader_folder/update.py?$RANDOM"
-            fi
             log_info "Running updater..."
             "$VENV/bin/python" "$UPDATE_PY"
         fi
