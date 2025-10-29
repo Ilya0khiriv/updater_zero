@@ -14,7 +14,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 
 VERSION_FILE = "version"
-UPDATE_JSON_URL = "https://raw.githubusercontent.com/Ilya0khiriv/updater_zero/main/pyqt5_vk_uploader_folder/update.json"
+UPDATE_JSON_URL = "https://raw.githubusercontent.com/Ilya0khiriv/updater_zero/main/pyqt5_vk_uploader_folder/update.json?_={int(time.time())}"
 
 
 def force_remove(path):
