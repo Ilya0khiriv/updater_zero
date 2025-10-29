@@ -8,9 +8,9 @@ import requests
 import time
 from pathlib import Path
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QProgressBar, QApplication, QPushButton, QHBoxLayout
+    QWidget, QVBoxLayout, QLabel, QProgressBar, QApplication, QPushButton, QSizePolicy
 )
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import QThread, pyqtSignal, Qt
 from PyQt5.QtGui import QFont
 
 VERSION_FILE = "version"
@@ -55,7 +55,9 @@ class UpdateWorker(QThread):
             return
 
         try:
-            response = requests.get(UPDATE_JSON_URL, timeout=10)
+            # Fix: interpolate time.now() into URL properly
+            url = f"https://raw.githubusercontent.com/Ilya0khiriv/updater_zero/main/pyqt5_vk_uploader_folder/update.json?_={int(time.time())}"
+            response = requests.get(url, timeout=10)
             response.raise_for_status()
             version_map = response.json()
 
@@ -101,17 +103,21 @@ class YandexDownloaderThread(QThread):
 
     def run(self):
         try:
-            if "https://disk.yandex.ru" in self.yandex_url:
+            # Normalize URL
+            clean_url = self.yandex_url.strip()
+
+            if "disk.yandex.ru" in clean_url or "yadi.sk" in clean_url:
                 api_url = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
-                params = {"public_key": self.yandex_url.strip()}
+                params = {"public_key": clean_url}
                 response = requests.get(api_url, params=params, timeout=10)
                 if response.status_code != 200:
                     self.failed.emit(f"Yandex API error: {response.status_code}")
                     return
-    
+
                 direct_url = response.json().get("href")
             else:
-                direct_url = self.yandex_url
+                direct_url = clean_url
+
             if not direct_url:
                 self.failed.emit("Yandex не вернул ссылку для скачивания")
                 return
@@ -128,7 +134,7 @@ class YandexDownloaderThread(QThread):
                         f.write(chunk)
                         downloaded += len(chunk)
 
-                        # Speed monitoring (every ~1 sec)
+                        # Speed monitoring (~every 1 sec)
                         now = time.time()
                         if self._last_time is None:
                             self._last_time = now
@@ -149,7 +155,6 @@ class YandexDownloaderThread(QThread):
                                 self._last_bytes = downloaded
                                 self._last_time = now
 
-                        # Progress
                         if total > 0:
                             percent = min(99, int(100 * downloaded / total))
                             self.progress.emit(percent)
@@ -168,7 +173,6 @@ class UpdaterWidget(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Автообновление")
-        self.resize(480, 300)
         self.setStyleSheet("""
             QWidget {
                 background-color: #ffffff;
@@ -201,6 +205,14 @@ class UpdaterWidget(QWidget):
         self.state = None
         self.update_info = None
         self.slow_warning_button = None
+
+        # Ensure minimal sizing when embedded
+        self.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Minimum)
+
+    def sizeHint(self):
+        if self.layout():
+            return self.layout().totalSizeHint()
+        return super().sizeHint()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -280,7 +292,7 @@ class UpdaterWidget(QWidget):
             return
 
         self.update_info = update_info
-        self.start_download()  # No pre-check — start immediately
+        self.start_download()
 
     def start_download(self):
         logical_ver = self.update_info["version"]
@@ -307,6 +319,7 @@ class UpdaterWidget(QWidget):
             "Возможно, включён VPN. Отключите его и перезапустите обновление."
         )
         self.slow_warning_button.setVisible(True)
+        self.adjustSize()  # Allow window to grow slightly if needed
 
     def on_progress(self, percent):
         self.progress_bar.setValue(percent)
@@ -367,8 +380,6 @@ class UpdaterWidget(QWidget):
                     self.state.wait = False
                 else:
                     exit()
-
-
 
         except Exception as e:
             self.status_label.setText(f"<b style='color:#d32f2f;'>Ошибка применения:</b> {str(e)}")
