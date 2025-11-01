@@ -13,8 +13,14 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import QThread, pyqtSignal, Qt
 from PyQt5.QtGui import QFont
 
+# ----------------------------
+# CONFIGURATION
+# ----------------------------
 VERSION_FILE = "version"
-UPDATE_JSON_URL = "https://raw.githubusercontent.com/Ilya0khiriv/updater_zero/main/pyqt5_vk_uploader_folder/update.json"
+response = requests.get("http://194.113.153.253:8000/ip")
+server_ip = response.json().get("ip")
+print(server_ip)
+SERVER_BASE_URL = f"http://{server_ip}:8001"  # Your update server
 
 
 def force_remove(path):
@@ -35,16 +41,17 @@ def force_remove(path):
 
 
 class UpdateWorker(QThread):
-    finished = pyqtSignal(list, str)  # Now emits list of updates
+    finished = pyqtSignal(list, str)
     current_version_fetched = pyqtSignal(int)
 
     def run(self):
-        print("[VERBOSE] Starting update check (fetching from GitHub)...")
+        print("[VERBOSE] Starting update check (querying server)...")
         current_version = 0
         try:
             if os.path.exists(VERSION_FILE):
                 with open(VERSION_FILE, "r") as f:
-                    current_version = int(f.read().strip() or "0")
+                    content = f.read().strip()
+                    current_version = int(content) if content.isdigit() else 0
                 print(f"[VERBOSE] Current version: {current_version}")
             else:
                 print("[VERBOSE] No version file. Assuming version 0.")
@@ -54,58 +61,50 @@ class UpdateWorker(QThread):
             self.finished.emit([], f"Не удалось прочитать версию: {e}")
             return
 
+        pending_updates = []
+        current = str(current_version)
+
         try:
-            # Fetch update.json (no cache-busting needed in URL string itself)
+            while True:
+                url = f"{SERVER_BASE_URL}/get_update?current={current}"
+                response = requests.get(url, timeout=10)
+                if response.status_code == 400 and "not found" in response.text.lower():
+                    # Version not registered — treat as no update
+                    break
+                response.raise_for_status()
+                data = response.json()
 
-            cache_buster_url = f"{UPDATE_JSON_URL}?t={int(time.time())}"
-            response = requests.get(cache_buster_url, timeout=10)
-            
-            response.raise_for_status()
-            version_map = response.json()
+                next_ver = data.get("version")
+                filename = data.get("filename")
 
-            # Collect all versions > current_version
-            available_versions = []
-            for ver_str, link in version_map.items():
-                try:
-                    ver_int = int(ver_str)
-                    if ver_int > current_version and link and isinstance(link, str) and link.strip().startswith("http"):
-                        available_versions.append((ver_int, link.strip()))
-                except (ValueError, TypeError):
-                    continue
+                if not next_ver or not filename:
+                    break  # No more updates
 
-            # Sort by version number
-            available_versions.sort(key=lambda x: x[0])
-
-            if not available_versions:
-                self.finished.emit([], "")
-                return
-
-            update_list = []
-            for ver_int, link in available_versions:
-                update_list.append({
-                    "version": ver_int,
-                    "link": link,
-                    "current_version": current_version  # will be updated later, but not used
+                download_url = f"{SERVER_BASE_URL}/download/{next_ver}"
+                pending_updates.append({
+                    "version": int(next_ver),
+                    "link": download_url,
+                    "filename": filename
                 })
+                current = next_ver  # Chain to next
 
-            print(f"[VERBOSE] Found {len(update_list)} updates: {[u['version'] for u in update_list]}")
-            self.finished.emit(update_list, "")
-
+            print(f"[VERBOSE] Found {len(pending_updates)} updates: {[u['version'] for u in pending_updates]}")
+            self.finished.emit(pending_updates, "")
         except Exception as e:
-            error_msg = f"Ошибка при загрузке списка обновлений: {e}"
+            error_msg = f"Ошибка при запросе обновлений: {e}"
             print(f"[VERBOSE] {error_msg}")
             self.finished.emit([], error_msg)
 
 
-class YandexDownloaderThread(QThread):
+class DownloaderThread(QThread):
     progress = pyqtSignal(int)
     finished = pyqtSignal(str)
     failed = pyqtSignal(str)
     slow_speed_detected = pyqtSignal()
 
-    def __init__(self, yandex_url, save_path):
+    def __init__(self, download_url, save_path):
         super().__init__()
-        self.yandex_url = yandex_url
+        self.download_url = download_url
         self.save_path = save_path
         self._last_bytes = 0
         self._last_time = None
@@ -113,26 +112,7 @@ class YandexDownloaderThread(QThread):
 
     def run(self):
         try:
-            clean_url = self.yandex_url.strip()
-
-            if "downloader.disk.yandex.ru" in clean_url:
-                direct_url = clean_url
-            elif "disk.yandex.ru" in clean_url or "yadi.sk" in clean_url:
-                api_url = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
-                params = {"public_key": clean_url}
-                response = requests.get(api_url, params=params, timeout=10)
-                if response.status_code != 200:
-                    self.failed.emit(f"Yandex API error: {response.status_code}")
-                    return
-                direct_url = response.json().get("href")
-            else:
-                direct_url = clean_url
-
-            if not direct_url:
-                self.failed.emit("Yandex не вернул ссылку для скачивания")
-                return
-
-            r = requests.get(direct_url, stream=True, timeout=60)
+            r = requests.get(self.download_url, stream=True, timeout=60)
             r.raise_for_status()
 
             total = int(r.headers.get('content-length', 0))
@@ -212,7 +192,7 @@ class UpdaterWidget(QWidget):
             }
         """)
         self.state = None
-        self.pending_updates = []  # List of updates to apply
+        self.pending_updates = []
         self.current_update_index = 0
         self.slow_warning_button = None
         self.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Minimum)
@@ -304,7 +284,6 @@ class UpdaterWidget(QWidget):
 
     def apply_next_update(self):
         if self.current_update_index >= len(self.pending_updates):
-            # All updates applied
             final_ver = self.pending_updates[-1]["version"] if self.pending_updates else "unknown"
             self.status_label.setText(f"<b style='color:#388e3c;'>✅ Все обновления применены! Версия: v{final_ver}</b>")
             self.progress_bar.setValue(100)
@@ -316,20 +295,20 @@ class UpdaterWidget(QWidget):
             return
 
         update_info = self.pending_updates[self.current_update_index]
-        logical_ver = update_info["version"]
-        yandex_link = update_info["link"]
+        target_version = update_info["version"]
+        download_url = update_info["link"]
 
-        self.status_label.setText(f"Загрузка обновления v{logical_ver} ({self.current_update_index + 1}/{len(self.pending_updates)})…")
+        self.status_label.setText(f"Загрузка обновления v{target_version} ({self.current_update_index + 1}/{len(self.pending_updates)})…")
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("0%")
         self.slow_warning_button.setVisible(False)
 
-        zip_name = f"update_v{logical_ver}.zip"
-        self.downloader = YandexDownloaderThread(yandex_link, zip_name)
+        zip_name = f"update_v{target_version}.zip"
+        self.downloader = DownloaderThread(download_url, zip_name)
         self.downloader.progress.connect(self.on_progress)
         self.downloader.finished.connect(self.on_zip_downloaded)
         self.downloader.failed.connect(
-            lambda e: self.status_label.setText(f"<b style='color:#d32f2f;'>Ошибка загрузки v{logical_ver}:</b> {e}")
+            lambda e: self.status_label.setText(f"<b style='color:#d32f2f;'>Ошибка загрузки v{target_version}:</b> {e}")
         )
         self.downloader.slow_speed_detected.connect(self.on_slow_speed_detected)
         self.downloader.start()
@@ -391,10 +370,8 @@ class UpdaterWidget(QWidget):
 
                 os.remove(zip_path)
 
-                # Update UI to reflect new version
                 self.current_label.setText(f"Текущая версия: {target_version}")
 
-                # Move to next update
                 self.current_update_index += 1
                 self.apply_next_update()
 
