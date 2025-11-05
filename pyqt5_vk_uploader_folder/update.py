@@ -386,6 +386,13 @@ class UpdaterWidget(QWidget):
             for zip_info in zipf.infolist():
                 if zip_info.filename in ['update_metadata.json', snapshot_file or '']:
                     continue
+
+                    # 🔒 Skip hidden/system folders that shouldn't be touched
+                parts = Path(filename).parts
+                if any(part.startswith('.') and part not in ('.', '..') for part in parts):
+                    print(f"[VERBOSE] Skipping hidden/system file: {filename}")
+                    continue
+        
                 target = (Path.cwd() / zip_info.filename).resolve()
                 if not zip_info.is_dir():
                     if target.exists():
