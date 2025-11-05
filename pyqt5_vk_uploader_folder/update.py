@@ -346,115 +346,135 @@ class UpdaterWidget(QWidget):
         self.progress_bar.setValue(percent)
         self.progress_bar.setFormat(f"{percent}%")
 
-    def on_zip_downloaded(self, zip_path):
-    update_info = self.pending_updates[self.current_update_index]
-    target_version = update_info["version"]
+        def on_zip_downloaded(self, zip_path):
+        update_info = self.pending_updates[self.current_update_index]
+        target_version = update_info["version"]
 
-    # Initialize retry count if not present
-    if "retry_count" not in update_info:
-        update_info["retry_count"] = 0
+        if "retry_count" not in update_info:
+            update_info["retry_count"] = 0
 
-    max_retries = 2  # Allow 2 retries (3 total attempts)
+        max_retries = 2
 
-    self.status_label.setText(f"Применение обновления v{target_version}…")
+        self.status_label.setText(f"Применение обновления v{target_version}…")
 
-    try:
-        with zipfile.ZipFile(zip_path, 'r') as zipf:
-            if 'update_metadata.json' not in zipf.namelist():
-                raise ValueError("Файл update_metadata.json отсутствует в архиве")
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zipf:
+                if 'update_metadata.json' not in zipf.namelist():
+                    raise ValueError("Архив обновления повреждён: отсутствует update_metadata.json")
 
-            metadata = json.loads(zipf.read('update_metadata.json'))
+                metadata = json.loads(zipf.read('update_metadata.json'))
 
-            # Delete files/dirs as instructed
-            for file in metadata.get('deleted_files', []):
-                fp = (Path.cwd() / file).resolve()
-                if fp.exists():
-                    force_remove(str(fp))
+                # --- Удаление старых файлов и папок ---
+                for file in metadata.get('deleted_files', []):
+                    fp = (Path.cwd() / file).resolve()
+                    try:
+                        if fp.exists():
+                            force_remove(str(fp))
+                    except Exception as e:
+                        print(f"[VERBOSE] Не удалось удалить файл {fp}: {e}")
 
-            for dir_path in metadata.get('deleted_dirs', []):
-                dp = (Path.cwd() / dir_path).resolve()
-                if dp.exists():
-                    force_remove(str(dp))
+                for dir_path in metadata.get('deleted_dirs', []):
+                    dp = (Path.cwd() / dir_path).resolve()
+                    try:
+                        if dp.exists():
+                            force_remove(str(dp))
+                    except Exception as e:
+                        print(f"[VERBOSE] Не удалось удалить папку {dp}: {e}")
 
-            # Find snapshot (if any)
-            snapshot_file = next(
-                (name for name in zipf.namelist() if name.startswith('snapshot_') and name.endswith('.json')),
-                None
-            )
+                # --- Найдём snapshot, если есть ---
+                snapshot_file = next(
+                    (name for name in zipf.namelist()
+                     if name.startswith('snapshot_') and name.endswith('.json')),
+                    None
+                )
 
-            # Extract all relevant files
-            for zip_info in zipf.infolist():
-                filename = zip_info.filename
-            
-                # Skip metadata files
-                if filename in ['update_metadata.json', snapshot_file or '']:
-                    continue
-            
-                # 🔒 Skip files in hidden/system directories (e.g., .idea/, .git/)
-                path_parts = Path(filename).parts
-                if any(part.startswith('.') and part not in ('.', '..') for part in path_parts):
-                    print(f"[VERBOSE] Skipping hidden/system path in update: {filename}")
-                    continue
-            
-                target = (Path.cwd() / filename).resolve()
-            
-                # Ensure we're not escaping the app directory (optional but secure)
+                # --- Извлечение новых файлов ---
+                for zip_info in zipf.infolist():
+                    filename = zip_info.filename
+
+                    # Пропускаем метафайлы
+                    if filename in ('update_metadata.json', snapshot_file or ''):
+                        continue
+
+                    # 🔒 Пропускаем всё, что содержит скрытые/системные компоненты пути
+                    parts = Path(filename).parts
+                    if any(part.startswith('.') for part in parts):
+                        print(f"[VERBOSE] Пропущен скрытый путь: {filename}")
+                        continue
+
+                    # Защита от path traversal
+                    target = (Path.cwd() / filename).resolve()
+                    try:
+                        target.relative_to(Path.cwd())
+                    except ValueError:
+                        print(f"[WARN] Подозрительный путь вне рабочей директории: {filename}")
+                        continue
+
+                    if not zip_info.is_dir():
+                        try:
+                            if target.exists():
+                                force_remove(str(target))
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            zipf.extract(zip_info, path=Path.cwd())
+                        except Exception as e:
+                            print(f"[VERBOSE] Ошибка при извлечении {filename}: {e}")
+                            raise  # если не удалось — считаем обновление битым
+
+                # --- Создание новых папок (если указаны) ---
+                for dir_path in metadata.get('added_dirs', []):
+                    try:
+                        (Path.cwd() / dir_path).mkdir(parents=True, exist_ok=True)
+                    except Exception as e:
+                        print(f"[VERBOSE] Не удалось создать папку {dir_path}: {e}")
+
+                # --- Обновление версии ---
+                with open(VERSION_FILE, 'w') as f:
+                    f.write(str(target_version))
+
+                # --- Удаление ZIP-архива ---
                 try:
-                    target.relative_to(Path.cwd())
-                except ValueError:
-                    print(f"[WARN] Skipping path outside app dir: {filename}")
-                    continue
-            
-                if not zip_info.is_dir():
-                    if target.exists():
-                        force_remove(str(target))
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    zipf.extract(zip_info, path=Path.cwd())
+                    os.remove(zip_path)
+                except Exception as e:
+                    print(f"[WARN] Не удалось удалить временный архив {zip_path}: {e}")
 
-            # Create added directories
-            for dir_path in metadata.get('added_dirs', []):
-                (Path.cwd() / dir_path).mkdir(parents=True, exist_ok=True)
+                # --- Переход к следующему обновлению ---
+                self.current_label.setText(f"Текущая версия: {target_version}")
+                self.current_update_index += 1
+                self.apply_next_update()
 
-            # Update version file
-            with open(VERSION_FILE, 'w') as f:
-                f.write(str(target_version))
+        except Exception as e:
+            # Удаляем битый ZIP
+            try:
+                if os.path.exists(zip_path):
+                    os.remove(zip_path)
+            except Exception as cleanup_err:
+                print(f"[WARN] Не удалось удалить архив после ошибки: {cleanup_err}")
 
-            # Cleanup ZIP
-            os.remove(zip_path)
+            update_info["retry_count"] += 1
 
-            # Success: move to next update
-            self.current_label.setText(f"Текущая версия: {target_version}")
-            self.current_update_index += 1
-            self.apply_next_update()
-
-    except Exception as e:
-        os.remove(zip_path)  # Remove corrupted/invalid ZIP
-        update_info["retry_count"] += 1
-
-        if update_info["retry_count"] <= max_retries:
-            self.status_label.setText(
-                f"<b style='color:#f57c00;'>⚠️ Ошибка при применении v{target_version} (попытка {update_info['retry_count']}/3). "
-                f"Повторная загрузка…</b>"
-            )
-            # Re-trigger download for same update
-            yandex_link = update_info["link"]
-            zip_name = f"update_v{target_version}.zip"
-            self.downloader = YandexDownloaderThread(yandex_link, zip_name)
-            self.downloader.progress.connect(self.on_progress)
-            self.downloader.finished.connect(self.on_zip_downloaded)
-            self.downloader.failed.connect(
-                lambda e: self.status_label.setText(f"<b style='color:#d32f2f;'>Ошибка загрузки v{target_version}:</b> {e}")
-            )
-            self.downloader.slow_speed_detected.connect(self.on_slow_speed_detected)
-            self.downloader.start()
-        else:
-            self.status_label.setText(
-                f"<b style='color:#d32f2f;'>❌ Не удалось применить v{target_version} после {max_retries + 1} попыток:</b> {str(e)}"
-            )
-            print(f"[VERBOSE] Update apply failed permanently: {e}")
-            if self.state:
-                self.state.wait = False
-
+            if update_info["retry_count"] <= max_retries:
+                self.status_label.setText(
+                    f"<b style='color:#f57c00;'>⚠️ Ошибка при распаковке v{target_version} (попытка {update_info['retry_count']}/3). "
+                    f"Перезагрузка обновления…</b>"
+                )
+                # Повторная загрузка
+                yandex_link = update_info["link"]
+                zip_name = f"update_v{target_version}.zip"
+                self.downloader = YandexDownloaderThread(yandex_link, zip_name)
+                self.downloader.progress.connect(self.on_progress)
+                self.downloader.finished.connect(self.on_zip_downloaded)
+                self.downloader.failed.connect(
+                    lambda err: self.status_label.setText(f"<b style='color:#d32f2f;'>Ошибка загрузки v{target_version}:</b> {err}")
+                )
+                self.downloader.slow_speed_detected.connect(self.on_slow_speed_detected)
+                self.downloader.start()
+            else:
+                self.status_label.setText(
+                    f"<b style='color:#d32f2f;'>❌ Обновление v{target_version} не удалось после {max_retries + 1} попыток:</b> {str(e)}"
+                )
+                print(f"[ERROR] Постоянная ошибка обновления v{target_version}: {e}")
+                if self.state:
+                    self.state.wait = False
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
