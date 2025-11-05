@@ -384,16 +384,27 @@ class UpdaterWidget(QWidget):
 
             # Extract all relevant files
             for zip_info in zipf.infolist():
-                if zip_info.filename in ['update_metadata.json', snapshot_file or '']:
+                filename = zip_info.filename
+            
+                # Skip metadata files
+                if filename in ['update_metadata.json', snapshot_file or '']:
                     continue
-
-                    # 🔒 Skip hidden/system folders that shouldn't be touched
-                parts = Path(filename).parts
-                if any(part.startswith('.') and part not in ('.', '..') for part in parts):
-                    print(f"[VERBOSE] Skipping hidden/system file: {filename}")
+            
+                # 🔒 Skip files in hidden/system directories (e.g., .idea/, .git/)
+                path_parts = Path(filename).parts
+                if any(part.startswith('.') and part not in ('.', '..') for part in path_parts):
+                    print(f"[VERBOSE] Skipping hidden/system path in update: {filename}")
                     continue
-        
-                target = (Path.cwd() / zip_info.filename).resolve()
+            
+                target = (Path.cwd() / filename).resolve()
+            
+                # Ensure we're not escaping the app directory (optional but secure)
+                try:
+                    target.relative_to(Path.cwd())
+                except ValueError:
+                    print(f"[WARN] Skipping path outside app dir: {filename}")
+                    continue
+            
                 if not zip_info.is_dir():
                     if target.exists():
                         force_remove(str(target))
