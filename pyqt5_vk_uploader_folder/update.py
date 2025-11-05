@@ -347,60 +347,95 @@ class UpdaterWidget(QWidget):
         self.progress_bar.setFormat(f"{percent}%")
 
     def on_zip_downloaded(self, zip_path):
-        update_info = self.pending_updates[self.current_update_index]
-        target_version = update_info["version"]
-        self.status_label.setText(f"Применение обновления v{target_version}…")
+    update_info = self.pending_updates[self.current_update_index]
+    target_version = update_info["version"]
 
-        try:
-            with zipfile.ZipFile(zip_path, 'r') as zipf:
-                if 'update_metadata.json' not in zipf.namelist():
-                    raise ValueError("Файл update_metadata.json отсутствует в архиве")
+    # Initialize retry count if not present
+    if "retry_count" not in update_info:
+        update_info["retry_count"] = 0
 
-                metadata = json.loads(zipf.read('update_metadata.json'))
+    max_retries = 2  # Allow 2 retries (3 total attempts)
 
-                for file in metadata.get('deleted_files', []):
-                    fp = (Path.cwd() / file).resolve()
-                    if fp.exists():
-                        force_remove(str(fp))
+    self.status_label.setText(f"Применение обновления v{target_version}…")
 
-                for dir_path in metadata.get('deleted_dirs', []):
-                    dp = (Path.cwd() / dir_path).resolve()
-                    if dp.exists():
-                        force_remove(str(dp))
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zipf:
+            if 'update_metadata.json' not in zipf.namelist():
+                raise ValueError("Файл update_metadata.json отсутствует в архиве")
 
-                snapshot_file = next(
-                    (name for name in zipf.namelist() if name.startswith('snapshot_') and name.endswith('.json')),
-                    None
-                )
+            metadata = json.loads(zipf.read('update_metadata.json'))
 
-                for zip_info in zipf.infolist():
-                    if zip_info.filename in ['update_metadata.json', snapshot_file or '']:
-                        continue
-                    target = (Path.cwd() / zip_info.filename).resolve()
-                    if not zip_info.is_dir():
-                        if target.exists():
-                            force_remove(str(target))
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        zipf.extract(zip_info, path=Path.cwd())
+            # Delete files/dirs as instructed
+            for file in metadata.get('deleted_files', []):
+                fp = (Path.cwd() / file).resolve()
+                if fp.exists():
+                    force_remove(str(fp))
 
-                for dir_path in metadata.get('added_dirs', []):
-                    (Path.cwd() / dir_path).mkdir(parents=True, exist_ok=True)
+            for dir_path in metadata.get('deleted_dirs', []):
+                dp = (Path.cwd() / dir_path).resolve()
+                if dp.exists():
+                    force_remove(str(dp))
 
-                with open(VERSION_FILE, 'w') as f:
-                    f.write(str(target_version))
+            # Find snapshot (if any)
+            snapshot_file = next(
+                (name for name in zipf.namelist() if name.startswith('snapshot_') and name.endswith('.json')),
+                None
+            )
 
-                os.remove(zip_path)
+            # Extract all relevant files
+            for zip_info in zipf.infolist():
+                if zip_info.filename in ['update_metadata.json', snapshot_file or '']:
+                    continue
+                target = (Path.cwd() / zip_info.filename).resolve()
+                if not zip_info.is_dir():
+                    if target.exists():
+                        force_remove(str(target))
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    zipf.extract(zip_info, path=Path.cwd())
 
-                # Update UI to reflect new version
-                self.current_label.setText(f"Текущая версия: {target_version}")
+            # Create added directories
+            for dir_path in metadata.get('added_dirs', []):
+                (Path.cwd() / dir_path).mkdir(parents=True, exist_ok=True)
 
-                # Move to next update
-                self.current_update_index += 1
-                self.apply_next_update()
+            # Update version file
+            with open(VERSION_FILE, 'w') as f:
+                f.write(str(target_version))
 
-        except Exception as e:
-            self.status_label.setText(f"<b style='color:#d32f2f;'>Ошибка применения v{target_version}:</b> {str(e)}")
-            print(f"[VERBOSE] Update apply error: {e}")
+            # Cleanup ZIP
+            os.remove(zip_path)
+
+            # Success: move to next update
+            self.current_label.setText(f"Текущая версия: {target_version}")
+            self.current_update_index += 1
+            self.apply_next_update()
+
+    except Exception as e:
+        os.remove(zip_path)  # Remove corrupted/invalid ZIP
+        update_info["retry_count"] += 1
+
+        if update_info["retry_count"] <= max_retries:
+            self.status_label.setText(
+                f"<b style='color:#f57c00;'>⚠️ Ошибка при применении v{target_version} (попытка {update_info['retry_count']}/3). "
+                f"Повторная загрузка…</b>"
+            )
+            # Re-trigger download for same update
+            yandex_link = update_info["link"]
+            zip_name = f"update_v{target_version}.zip"
+            self.downloader = YandexDownloaderThread(yandex_link, zip_name)
+            self.downloader.progress.connect(self.on_progress)
+            self.downloader.finished.connect(self.on_zip_downloaded)
+            self.downloader.failed.connect(
+                lambda e: self.status_label.setText(f"<b style='color:#d32f2f;'>Ошибка загрузки v{target_version}:</b> {e}")
+            )
+            self.downloader.slow_speed_detected.connect(self.on_slow_speed_detected)
+            self.downloader.start()
+        else:
+            self.status_label.setText(
+                f"<b style='color:#d32f2f;'>❌ Не удалось применить v{target_version} после {max_retries + 1} попыток:</b> {str(e)}"
+            )
+            print(f"[VERBOSE] Update apply failed permanently: {e}")
+            if self.state:
+                self.state.wait = False
 
 
 if __name__ == "__main__":
